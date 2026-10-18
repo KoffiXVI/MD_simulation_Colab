@@ -5,7 +5,7 @@ import shutil
 import time
 
 
-def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive'):
+def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive/MyDrive'):
     
     if not in_collab:
         return
