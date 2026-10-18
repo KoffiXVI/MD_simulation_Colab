@@ -4,23 +4,26 @@ import json
 import shutil
 import time
 
-
-def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive/MyDrive'):
+def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive'):
     
     if not in_collab:
         return
 
     drive.mount(mount_loc)
-    
-    os.makedirs(os.path.join(mount_loc, "MyDrive", dest), exist_ok=True)
 
-    if not os.path.exists(os.path.join(mount_loc, dest,"sources")):
-        shutil.copytree('/content/MD_Simulation_Colab/sources',dest)
+    project_dir = os.path.join(mount_loc, "MyDrive", dest)
+    sources_dir = os.path.join(project_dir, "sources")
+    runtime_sources = "/content/MD_simulation_Colab/sources"
+
+    os.makedirs(project_dir, exist_ok=True)
+
+    if not os.path.exists(sources_dir):
+        shutil.copytree(runtime_sources,sources_dir)
         print("created source directory in drive")
 
-    os.chdir(os.path.join(mount_loc, dest))
+    os.chdir(project_dir)
 
-    print("current working directy at:",dest, os.getcwd())
+    print("current working directy at:", os.getcwd())
 
 #drive funcs
 
