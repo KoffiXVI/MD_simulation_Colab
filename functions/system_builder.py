@@ -1,5 +1,5 @@
 #We import the libraries that we will use
-from constants import *
+from .constants import *
 import json
 import numpy as np
 import openmm as mm

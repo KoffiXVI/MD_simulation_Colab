@@ -1,9 +1,9 @@
-from constants import *
+from .constants import *
 import openmm as mm
 import openmm.app as app
 import numpy as np
 from openmm import unit, Vec3, OpenMMException
-from system_builder import load_model
+from .system_builder import load_model
 
 RESTRAINT_GROUP = 1
 
@@ -187,9 +187,12 @@ def _simulation(system, topology, temp, dt_fs, seed):
     try:
         return app.Simulation(topology, system, integ, *_platform()), integ
     except OpenMMException as e:
-        print("Error:",e)
-        print("PROCEEDING WITH CPU")
+        if os.environ.get("MD_ALLOW_CPU") != "1":     # a silent CPU run crawls and takes the cores
+            raise
+
+        print("Error:",e,'-> proceeding on CPU')
         return app.Simulation(topology, system, integ, mm.Platform.getPlatformByName("CPU"), {}), integ
+
 
 
 def _check(csv, since_ps=None, expect_density=1.00):
@@ -249,7 +252,7 @@ class Equilibrator():
 
     def set_ladder(self, ladder):
         if not isinstance(ladder, (tuple, list)):
-            return TypeError("Wrong format for setting a ladder")
+            raise TypeError("Wrong format for setting a ladder")
 
         self._ladder = ladder
 

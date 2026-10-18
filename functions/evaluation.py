@@ -1,4 +1,4 @@
-from constants import *
+from .constants import *
 import itertools, json
 from pathlib import Path
 import numpy as np
@@ -497,6 +497,13 @@ def analyze_fraying(run_dir, traj, max_ns=None, lo=None, hi=0.45, full_open=Fals
 
 # REPLICA ANALYSIS
 
+"""
+    metas = [json.loads((p / "_replica.json").read_text()) for p in reps]
+    if len({(m["build"], json.dumps(m.get("ladder"))) for m in metas}) > 1:
+        raise ValueError("replicas differ in build or equilibration ladder; pool them separately")
+"""
+
+
 def analyze_replicas(build_dir, traj="md", design=None, remote_root=None, fray_kw=None, **kw):
     """analyze_run + analyze_fraying on every finished replica, then the spread across them.
     Writes <build_dir>/replicas/pooled/<traj>_{pairs,ends,summary}.csv. Extra keyword
@@ -506,9 +513,10 @@ def analyze_replicas(build_dir, traj="md", design=None, remote_root=None, fray_k
     reps = sorted(p for p in root.glob("r[0-9]*") if (p / "_done.json").exists())
     if len(reps) < 2:
         raise ValueError(f"{len(reps)} finished replica(s) in {root}; need at least 2")
-    builds = {json.loads((p / "_replica.json").read_text())["build"] for p in reps}
-    if len(builds) > 1:
-        raise ValueError(f"replicas come from different builds: {sorted(builds)}")
+
+    metas = [json.loads((p / "_replica.json").read_text()) for p in reps]
+    if len({(m["build"], json.dumps(m.get("ladder"))) for m in metas}) > 1:
+        raise ValueError("replicas differ in build or equilibration ladder; pool them separately")
 
     P, E, S = [], [], []
     for p in reps:

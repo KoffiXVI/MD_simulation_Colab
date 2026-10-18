@@ -1,4 +1,4 @@
-from constants import *
+from .constants import *
 import os
 import json 
 import shutil
@@ -7,14 +7,18 @@ import time
 
 def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive'):
     
-    if in_collab:
-        drive.mount(mount_loc)
-        os.makedirs(dest, exist_ok=True)
-        if not os.path.exists(f"{dest}/sources"):
-            shutil.copytree('MD_Simulation_Colab/sources',dest)
-            print("created source directory in drive")
+    if not in_collab:
+        return
 
-    os.chdir(dest)
+    drive.mount(mount_loc)
+    os.makedirs(os.path.join(mount_loc, dest), exist_ok=True)
+
+    if not os.path.exists(os.path.join(mount_loc, dest,"sources")):
+        shutil.copytree('/content/MD_Simulation_Colab/sources',dest)
+        print("created source directory in drive")
+
+    os.chdir(os.path.join(mount_loc, dest))
+
     print("current working directy at:",dest, os.getcwd())
 
 #drive funcs

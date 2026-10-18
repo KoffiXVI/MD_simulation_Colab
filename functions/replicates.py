@@ -1,7 +1,7 @@
-from production import produce
-from system_builder import check_box
-from colab_funcs import _mirror, restore_from_drive
-from equilibration import Equilibrator
+from .production import produce
+from .system_builder import check_box
+from .colab_funcs import _mirror, restore_from_drive
+from .equilibration import Equilibrator
 import gc, hashlib, time, json, socket, uuid, shutil
 from pathlib import Path
 import openmm as mm
@@ -104,7 +104,7 @@ def run_replicas(build_dir, n_rep=3, only=None, ns=200, max_hours=3, reserve_min
 
             # 3. production resumes from its checkpoint, with the settings recorded for it
             print(f"{name}: production (seed {meta['seed_prod']})")
-            sim = produce(local, save_name=save_name, ns=meta["ns"], save_ps=meta["save_ps"],
+            sim = produce(local, save_name=save_name, ns=meta["ns"],
                           seed=meta["seed_prod"], max_hours=hours_left(),
                           reserve_min=reserve_min, mirror_to=remote,
                           mirror_every_min=mirror_every_min, **common)

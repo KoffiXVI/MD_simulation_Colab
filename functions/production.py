@@ -1,9 +1,9 @@
-from constants import *
-import signal
-from colab_funcs import _mirror
-from system_builder import load_model
-from equilibration import _add_barostat, _simulation
+from .constants import *
+from .colab_funcs import _mirror
+from .system_builder import load_model
+from .equilibration import _add_barostat, _simulation
 import time
+import signal
 import openmm as mm
 import mdtraj as md
 import openmm.app as app

@@ -16,7 +16,7 @@ A3_Z1_30_nt_pdb_ori = "sources/A3_aptamer_triggers/A3_Z1_30_ini.pdb"
 A3_Z1_24_nt_pdb_ori = "sources/A3_aptamer_triggers/A3_Z1_24_ini.pdb"
 A3_P1_res_pdb_ori = "sources/A3_aptamer_triggers/A3_P1_ini.pdb"
 
-results_folder = os.path.abspath("results")
+results_folder = "results"
 Z1_ori_res_folder = os.path.join(results_folder, "Z1_ori")
 Z1_ext_res_folder = os.path.join(results_folder, "Z1_ext")
 
