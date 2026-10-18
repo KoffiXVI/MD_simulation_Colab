@@ -11,7 +11,8 @@ def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive'):
         return
 
     drive.mount(mount_loc)
-    os.makedirs(os.path.join(mount_loc, dest), exist_ok=True)
+    
+    os.makedirs(os.path.join(mount_loc, "MyDrive", dest), exist_ok=True)
 
     if not os.path.exists(os.path.join(mount_loc, dest,"sources")):
         shutil.copytree('/content/MD_Simulation_Colab/sources',dest)
