@@ -1,3 +1,6 @@
+"""Equilibration: a ladder of minimisations and restrained or free MD rungs that takes a
+built system to an equilibrated state, printing diagnostics after every rung."""
+
 from .constants import *
 import openmm as mm
 import openmm.app as app
@@ -110,6 +113,13 @@ def _temperature(sim, system):
 
 
 def _report_dynamics(sim, kind, k, ns, ref, heavy, temp, system, topology=None):
+    """Print one line after an MD rung: temperature, box density, and how far the solute's
+    heavy atoms are from the reference (raw while restrained, after superposition when
+    free; d_rms is their mean displacement). 
+
+    Flags a temperature more than 15 K off target, a free-rung density more than 0.03 g/cm3 
+    from the expected value, and restrained rungs whose mean displacement stays under 0.5 A.
+    """
 
     st = sim.context.getState(getPositions=True, getEnergy=True,
                               enforcePeriodicBox=False)
@@ -144,6 +154,12 @@ def _report_dynamics(sim, kind, k, ns, ref, heavy, temp, system, topology=None):
 
 
 def _report_minimisation(sim, log, k, e_before, system):
+    """Print the energy before and after a minimisation, the largest residual force
+    (flagged above 1000 kJ/mol/nm: not converged) 
+    
+    On restrained rungs, prints the restraint energy (flagged above 2% of the total: 
+    the reference geometry fights the force field)."""
+
     tot = sim.context.getState(getEnergy=True).getPotentialEnergy(
         ).value_in_unit(unit.kilojoule_per_mole)
     print(f"  min  k={k:>5}  {e_before:>13,.0f} -> {tot:>13,.0f} kJ/mol in {log.calls} calls")
@@ -166,6 +182,7 @@ def _report_minimisation(sim, log, k, e_before, system):
 
 
 def _platform():
+    """Fastest available platform: CUDA, HIP, then OpenCL (mixed precision), else CPU"""
   #Platform used for the sims
     names = [mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())]
     for n in ("CUDA", "HIP", "OpenCL"):
@@ -175,10 +192,23 @@ def _platform():
 
 
 def _add_barostat(system, temp, freq=100, bar_value=1):
+    """Add a Monte Carlo barostat (constant pressure) at `bar_value` bar and `temp` K,
+    attempting a box move every `freq` steps. Modifies `system` in place."""
+
     system.addForce(mm.MonteCarloBarostat(bar_value * unit.bar, temp * unit.kelvin, freq))
 
 
 def _simulation(system, topology, temp, dt_fs, seed):
+    """Create an app.Simulation with a LangevinMiddle integrator (friction 1/ps, step
+    `dt_fs` fs, constraint tolerance 1e-6, seeded with `seed`) on the platform.
+
+    Note
+    ----
+    If the GPU context cannot be created, it falls back to the CPU platform after printing
+    the error. That keeps a test going but is far too slow for production, and a CPU
+    process competes for every core with parallel runs: check the platform name that
+    equilibrate prints, and the ns/day during production."""
+
     #Fixed the friction coeff here. 
     integ = mm.LangevinMiddleIntegrator(temp * unit.kelvin, 1 / unit.picosecond,
                                         dt_fs * unit.femtosecond)
@@ -196,9 +226,16 @@ def _simulation(system, topology, temp, dt_fs, seed):
 
 
 def _check(csv, since_ps=None, expect_density=1.00):
-    """
-    Use the logging csv to assess the quality of the structure after a ladder run
-    """
+    """Judge the free rung of an equilibration from its CSV (rows from `since_ps` on).
+
+    Prints the mean density over the rung's last quarter against `expect_density` (OK
+    within 0.03 g/cm3) and the total-energy drift, a least-squares slope, with its
+    block-to-block spread (OK within twice that spread or under 500 kJ/mol/ns). 
+    
+    Note
+    ----
+    A significant drift means the system is still relaxing: lengthen the free rung."""
+
     try:
         rows = np.atleast_1d(np.genfromtxt(csv, delimiter=",", names=True, deletechars=" "))
     except (IndexError, ValueError):
@@ -228,6 +265,22 @@ def _check(csv, since_ps=None, expect_density=1.00):
 
 
 class Equilibrator():
+    """Equilibration protocol, defined as a ladder of rungs (kind, k, ns).
+
+    - kind:  
+        - "min": energy minimisation (ns ignored); 
+        - "heat": MD ramping from 10 K to the target temperature in 20 increments; 
+        - "npt": MD at constant pressure. A barostat is present on every MD rung.
+
+    - k:  force constant of the positional restraint on solute heavy atoms, kJ/mol/nm^2,
+          with energy k*d^2 (Amber convention); 0 means unrestrained
+
+    - ns:    length of an MD rung, in ns
+
+    Default ladder: restrained minimisation (k=1000), free minimisation, 0.2 ns heating at
+    k=1000, 0.3 ns at k=500, then 5 ns free. Pass a list of rungs to replace it;
+    `run_replicas` records the ladder used in each replica's _replica.json.
+    """
     def __init__(self, ladder=None):
         # (restraint k in kJ/mol/nm^2, nanoseconds). 0 ns = minimisation.
 
@@ -243,14 +296,18 @@ class Equilibrator():
             self.set_ladder(ladder)
 
     def reset(self):
+        """Restore the default ladder and print it."""
         self._ladder = self._DEFAULT_LADDER
         print(self.ladder)
 
     @property
     def ladder(self):
+        """The current list of (kind, k, ns) rungs."""
         return self._ladder
 
     def set_ladder(self, ladder):
+        """Replace the ladder with a list or tuple of (kind, k, ns) rungs"""
+
         if not isinstance(ladder, (tuple, list)):
             raise TypeError("Wrong format for setting a ladder")
 
@@ -259,6 +316,46 @@ class Equilibrator():
     
     def equilibrate(self, out, sys_name="system", model_name="model", equil_name="equil",
                     temp=310.15, dt_fs=4.0, seed=1,save_ps=10):
+        """Run the ladder on the system built in `out`.
+
+        Parameters
+        ----------
+        out : path-like
+            Build or replica folder holding <sys_name>.xml and <model_name>.cif.
+        sys_name, model_name : str
+            Stems of the files written by build_system.
+        equil_name : str
+            Stem of every file written here.
+        temp : float
+            Target temperature in K.
+        dt_fs : float
+            Time step in fs; 4 fs relies on the build's hydrogen mass repartitioning.
+        seed : int
+            Seeds the initial velocities and the thermostat; one seed per replica (0 lets
+            OpenMM choose at random, which is not reproducible).
+        save_ps : float
+            CSV interval in ps.
+
+        Files written in `out`
+        ----------------------
+        - `<equil_name>`.csv:        step, time, total energy, temperature, density, speed
+        - `<equil_name>`.xtc:        all atoms every 20 ps, for free rungs of 1 ns or more
+        - `<equil_name>`.xml:        final positions, velocities and box: production's start
+        - `<equil_name>`_final.cif:  the same coordinates, for viewing
+
+        Reading the printed diagnostics
+        -------------------------------
+        - ladder sigma:    thermal spread each restraint allows; flagged when too tight for
+                        any relaxation
+        - min lines:       maxF should end below ~1000 kJ/mol/nm; a large restraint energy
+                        means the built model's geometry fights the force field
+        - heat/npt lines:  T within a few K of target; d_rms a fraction of an A while
+                        restrained, several A once free, more with floppy tails
+        - density, drift:  checked over the free rung; both OK means ready for production
+
+        For base pairing and sugar pucker over the free rung, run
+        analyze_run(out, equil_name).
+        """
         out = Path(out)
         system, model = load_model(out, sys_name, model_name)
         topology, positions = model.topology, model.positions

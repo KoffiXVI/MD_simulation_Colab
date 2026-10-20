@@ -1,3 +1,4 @@
+"""Constants shared by the whole package."""
 in_collab = True
 import os
 from pathlib import Path

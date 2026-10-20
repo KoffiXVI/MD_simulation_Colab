@@ -1,3 +1,5 @@
+"""From an input structure to a solvated, neutralised OpenMM system: clean the strands,
+build the box, write the system, check the box size."""
 #We import the libraries that we will use
 from .constants import *
 import json
@@ -36,9 +38,10 @@ def save_model(system, modeller, out, sys_name="system", modeller_name="model"):
 
 
 def load_model(out, sys_name, modeller_name):
-    """
-    load the saved model
-    """
+    """load the saved model. Returns the openmm.System and
+    an app.Modeller with the .cif topology and positions. These are the built,
+    unequilibrated coordinates"""
+    
     out = Path(out)
     system = mm.XmlSerializer.deserialize((out / f"{sys_name}.xml").read_text())
     cif = app.PDBxFile(str(out / f"{modeller_name}.cif"))
@@ -49,8 +52,31 @@ def load_model(out, sys_name, modeller_name):
 
 def prepare_dna_pdb(pdb_in, pdb_out, rna_to_dna=True, expect_strands=None, sequences=None,
                     replace_modified=False):
-    """Thin DNA-specific layer around PDBFixer: we decide what the strands are and strip
-    5'-phosphates; PDBFixer repairs residues and atoms from its templates."""
+    """Clean an input structure into force-field-ready DNA strands.
+
+    Keeps nucleotide heavy atoms (residues without C1' are dropped: water, ions, linkers,
+    non-nucleotide modifications); starts a new strand wherever the O3'-P link is missing
+    or longer than 2.5 A; gives each strand its own chain (A, B, ...); removes each strand's
+    5' phosphate (Amber's 5'-terminal templates have none); converts every residue to its
+    DNA template with PDBFixer, deleting atoms the template lacks (O2', OP3) and rebuilding
+    missing ones (C7 when U becomes T); then checks the result.
+
+    Parameters
+    ----------
+    pdb_in : path-like
+        Input .pdb, .cif or .pdbx.
+    pdb_out : path-like
+        Where the cleaned PDB is written.
+    rna_to_dna : bool
+        Convert RNA residues to DNA; with False, RNA raises ValueError.
+    expect_strands : int, optional
+        Raise ValueError unless exactly this many strands are found.
+    sequences : list of str, optional
+        Expected 5'->3' sequence per strand (U read as T); raise ValueError on a mismatch.
+    replace_modified : bool
+        Replace modified nucleotides by their parent residue instead of raising.
+
+    """
     pdb_in = Path(pdb_in)
     if not pdb_in.is_file():
         raise FileNotFoundError(f"{pdb_in} (working directory {Path.cwd()})")
@@ -159,9 +185,17 @@ def prepare_dna_pdb(pdb_in, pdb_out, rna_to_dna=True, expect_strands=None, seque
     return Path(pdb_out), log
 
 def check_box(build_dir, cutoff=1.0, model_name="model.cif"):
-    """Worst-case solute-image gap if the solute rotates rigidly: shortest periodic image
-    distance minus the solute's largest atom-atom distance. Leave room above the cutoff
-    for a floppy overhang, which can stretch beyond its starting size."""
+    """Worst-case gap between the solute and its periodic image if the solute turned as a
+    rigid body: the box's shortest lattice vector minus the solute's largest atom-atom
+    distance, read from `build_dir/model_name`. Returns the gap in nm
+
+    Note
+    ----
+    Under the nonbonded cutoff (1.0 nm) the molecule can interact with its own copy.
+    Single-stranded regions can stretch beyond their starting size, so leave a margin.
+    If a run's min_image_nm (analyze_run) still drops below 1.0 nm, rebuild with more
+    padding or interpret as is at your own risk.
+    """
     cif = app.PDBxFile(str(Path(build_dir) / model_name))
     X = np.array(cif.positions.value_in_unit(unit.nanometer))
     solute = [a.index for a in cif.topology.atoms()
@@ -179,6 +213,45 @@ def check_box(build_dir, cutoff=1.0, model_name="model.cif"):
 def build_system(pdb_file, out, dna_ff="OL21", water="OPC", salt=0.10, cation="Na+",
                  anion="Cl-", padding=1.5, fit_box=True, rna_to_dna=True,
                  expect_strands=None, sequences=None):
+
+    """Build a solvated, neutralised DNA system ready for equilibration.
+
+    Parameters
+    ----------
+    pdb_file : path-like
+        Input structure, cleaned first by prepare_dna_pdb.
+    out : path-like
+        Build folder, created if needed; every later step reads from it or below it.
+    dna_ff : {"OL21", "OL15", "bsc1"}
+        DNA force field (constants.DNA_FF).
+    water : {"OPC", "TIP3P"}
+        Water model (constants.WATER); ion parameters come with it.
+    salt : float
+        Salt concentration in mol/L, added on top of the neutralising counterions.
+    cation, anion : str
+        Ion species.
+    padding : float
+        Minimum distance between the solute and the box edge, in nm.
+    fit_box : bool
+        True: rotate the solute onto its principal axes and fit a rectangular box (least
+        water, valid only while the molecule keeps its orientation). False: a padding-sized
+        rhombic dodecahedron, which tolerates rotation; use it for long runs.
+    rna_to_dna, expect_strands, sequences
+        Passed to prepare_dna_pdb.
+
+    Files written in `out`
+    ----------------------
+     input_clean.pdb: cleaned structure
+
+     system.xml:      serialized System; its hash identifies the build for replicas
+
+    model.cif:       solvated starting coordinates: the restraint reference during
+                     equilibration and the in_model reference in analysis
+
+    build.json:      settings, OpenMM version, box size (nm), atom count, the cleaning log
+                     and solute_image_gap (check_box, nm)
+
+    """
 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)

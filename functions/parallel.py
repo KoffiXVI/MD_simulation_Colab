@@ -40,6 +40,7 @@ def start_mps():
 
 
 def stop_mps():
+    """Shut down the MPS daemon; processes started afterwards use the GPU normally."""
     subprocess.run(["nvidia-cuda-mps-control"], input="quit\n", text=True)
 
 
@@ -59,6 +60,7 @@ def _speed(rep_dir, save_name):
 
 
 def _gpu():
+    """GPU utilisation (%) and memory used (MiB) from nvidia-smi, as one string."""
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True)
@@ -68,10 +70,47 @@ def _gpu():
 
 
 def run_parallel(build_dir, reps, mps=True, poll_min=10, stagger_s=20, **kw):
-    """Run several replicas at once on this machine's GPU, one spawned process each.
-    kw goes to run_replicas (ns, max_hours, reserve_min, save_name, local_root,
-    remote_root, equil, ...). Interrupting the call asks every replica to checkpoint,
-    mirror and exit, as at its deadline. Returns {replica: exit code}."""
+    """Run several replicas at the same time on this machine's GPU, one process each.
+
+    Replica k runs run_replicas(build_dir, only=[k], **kw) in a freshly spawned process,
+    which imports the package anew (module edits apply at the next launch) and has its own
+    SESSION id. The call blocks, printing a status block every `poll_min` minutes, until
+    every process has ended.
+
+    Parameters
+    ----------
+    build_dir : path-like
+        Build folder, as for run_replicas.
+    reps : iterable of int
+        Replica numbers to run now, one process each (duplicates ignored).
+    mps : bool
+        Try to start NVIDIA MPS so the processes' GPU kernels run side by side.
+    poll_min : float
+        Minutes between status blocks.
+    stagger_s : float
+        Seconds between process starts.
+    **kw
+        Passed to run_replicas (ns, max_hours, reserve_min, save_name, local_root,
+        remote_root, equil, ...); local_root and save_name also locate each replica's CSV
+        for the speed readout.
+
+    Files written
+    -------------
+    - <local_root>/logs/rXX.log:   everything the replica prints, C++ output included
+
+    Reading the status block
+    ------------------------
+    GPU utilisation and memory, then each replica's state, current ns/day and last log
+    line, then their sum. Compare the sum with one replica's speed alone: another process
+    is worth adding while the sum keeps rising.
+
+    Notes
+    -----
+    Interrupting the call sends each replica one SIGINT: production checkpoints, mirrors
+    and exits as at its deadline; an equilibration in progress is abandoned and redone at
+    the next launch. The processes run in their own process groups and survive a kernel
+    restart; stop leftovers with `pkill -INT -f spawn_main`.
+    """
     build_dir, reps = Path(build_dir), sorted(set(reps))
     local_root = Path(kw.setdefault("local_root", "/content/replicas"))
     save_name = kw.setdefault("save_name", "md")

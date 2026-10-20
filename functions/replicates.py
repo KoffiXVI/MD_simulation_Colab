@@ -1,3 +1,6 @@
+"""Independent replicas of one build, each with its own equilibration and production,
+resumable across sessions and shared between Colab accounts through Drive."""
+
 from .production import produce
 from .system_builder import check_box
 from .colab_funcs import _mirror, restore_from_drive
@@ -24,6 +27,7 @@ def _claim(remote, hours):
 
 
 def _release(remote):
+    """Delete the replica's _lock.json if this session owns it."""
     f = remote / "_lock.json"
     try:
         if json.loads(f.read_text())["owner"] == SESSION:
@@ -37,12 +41,51 @@ def run_replicas(build_dir, n_rep=3, only=None, ns=200, max_hours=3, reserve_min
                  save_ps=10, local_root="/content/replicas", remote_root=None,
                  cleanup_local=False, equil=None, system="system.xml", model="model.cif",
                  equil_file="equil.xml"):
-    """Independent replicas of one built system: the same system.xml/model.cif, then its own
-    equilibration and production, with its own seeds, for each replica.
-    Resumable: rerun the same call in a new session and every replica continues where it
-    stopped; finished ones are skipped. Several accounts: give each session its own `only`,
-    e.g. only=[1, 2] here and only=[3] elsewhere.
-    Drive layout: <build_dir>/replicas/r01, r02, ..., each mirroring a local working copy.
+    
+    """Run independent replicas of one build, one after another, within a time budget.
+
+    Each replica gets a copy of the build (identified by a hash of system.xml), its own
+    equilibration and its own production, seeded with seed0 + k (equilibration) and
+    seed0 + 500 + k (production). Rerunning the same call resumes unfinished replicas and
+    skips finished ones, so the same cell serves every new session.
+
+    Parameters
+    ----------
+    build_dir : path-like
+        Build folder from build_system (on Drive in Colab).
+    n_rep : int
+        Replicas r01 .. r<n_rep> to run when `only` is not given.
+    only : list of int, optional
+        Replica numbers for this session; give each Colab account its own list.
+    ns, temp, dt_fs, save_ps : float
+        Production length (ns), temperature (K), time step (fs), frame interval (ps).
+        Recorded in _replica.json at a replica's first start; later calls reuse them.
+    max_hours : float
+        Wall-clock budget; no replica is started with less than reserve_min + 30 min left.
+    reserve_min, mirror_every_min : float
+        Passed to produce (clean-stop margin, Drive mirroring interval).
+    save_name : str
+        Production file stem in each replica folder (the `traj` of analyze_replicas).
+    seed0 : int
+        Base of the seeds; change it to generate a new, independent set.
+    local_root : path-like
+        Local working area; replica k lives in <local_root>/<build name>/rXX.
+    remote_root : path-like, optional
+        Drive folder holding the replicas (default <build_dir>/replicas); use a separate
+        one per protocol you want analysed separately.
+    cleanup_local : bool
+        Delete a replica's local copy once complete.
+    equil : Equilibrator, optional
+        Equilibration protocol; the default ladder when None.
+    system, model, equil_file : str
+        File names of the build and of the equilibrated state.
+
+    Files written per replica (<remote_root>/rXX, mirrored from the local copy)
+    --------------------------------------------------------------------------
+    copies of system.xml, model.cif and build.json; equil.* (equilibrate); <save_name>.*
+    (produce); _replica.json (build hash, seeds, settings, ladder, OpenMM version);
+    _manifest.json (sync_dir). On Drive only: _lock.json while a session works on the
+    replica, _done.json once its production is complete (only those are pooled).
     """
     if equil == None:
         equil = Equilibrator()

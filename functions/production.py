@@ -1,3 +1,6 @@
+"""Production: one resumable NPT trajectory per call, run on local disk and mirrored to
+Drive, with checkpoints that survive a killed session."""
+
 from .constants import *
 from .colab_funcs import _mirror
 from .system_builder import load_model
@@ -26,6 +29,8 @@ def _truncate_csv(path, step):
         path.write_text("\n".join([head] + kept) + "\n")
 
 def _count_frames(path, topology, fmt, subset=None):
+    """Frames in a trajectory read with `topology` (restricted to `subset` when the file
+    holds only those atoms); None if the file cannot be read."""
     top = md.Topology.from_openmm(topology)
     if subset is not None:
         top = top.subset(subset)
@@ -124,7 +129,10 @@ class AtomicCheckpointReporter(app.CheckpointReporter):
 
 
 def load_checkpoint_safely(sim, chk):
-    """Try the checkpoint, fall back to the backup generation."""
+    """Load `chk`, or its .bak backup if that fails, and validate what was restored
+    (finite positions and energy, non-degenerate box), since a truncated checkpoint can
+    load without error. Returns True on the first usable file, False if neither works."""
+
     for path, label in ((chk, "checkpoint"), (Path(str(chk) + ".bak"),
                                               "backup checkpoint")):
         if not path.exists():
@@ -157,8 +165,56 @@ def produce(out, sys_name="system", model_name="model", equil_name="equil",
             save_name="md", ns=200, temp=310.15, dt_fs=4.0, save_ps=10, seed=1,
             fmt="xtc", keep_water=False, max_hours=None, reserve_min=10.0,
             mirror_to=None, mirror_every_min=60.0):
-    """One trajectory, resumable. Rerun the same command after a timeout and it
-    continues from the checkpoint: no blocks, no pieces, no filename parsing."""
+    """Run, or resume, one NPT production trajectory of `ns` ns in `out`.
+
+    A first call starts from <equil_name>.xml. Every later call with the same arguments
+    resumes from <save_name>.chk, trims frames and CSV rows written after that checkpoint,
+    and carries on; a finished run returns immediately.
+
+    Parameters
+    ----------
+    out : path-like
+        Folder with the build files and the equilibrated state. Use local disk and mirror:
+        Drive cannot keep up with trajectory appends.
+    save_name : str
+        Stem of every file written; a new name starts a separate run.
+    ns : float
+        Total length in ns, not the length of this session's share.
+    temp, dt_fs : float
+        Temperature (K) and time step (fs).
+    save_ps : float
+        Frame and CSV interval in ps; checkpoints every 10 frames.
+    seed : int
+        Thermostat seed for a fresh start; a resume continues the checkpoint's random state.
+    fmt : {"xtc", "dcd"}
+        Trajectory format.
+    keep_water : bool
+        Also write water (much larger files); ions are always written.
+    max_hours : float, optional
+        Wall-clock budget; the run stops `reserve_min` minutes early to save cleanly.
+    mirror_to : path-like, optional
+        Drive folder to mirror `out` to, every `mirror_every_min` minutes and at the end.
+
+
+    Files written in `out`
+    ----------------------
+    - `<save_name>`.xtc:    solute and ions, unwrapped (strands never split across the box)
+    - `<save_name>`.csv:    step, time, potential energy, temperature, density, speed (ns/day)
+    - `<save_name>`.chk:    checkpoint, plus .chk.bak (the previous one)
+    - `<save_name>`.xml:    portable state, written at every exit
+
+    Notes
+    -----
+    SIGINT and SIGTERM (Colab's stop button, a kill) end the run as the deadline does:
+    final checkpoint, state and mirror. The closing lines give the speed in ns/day and the
+    time still needed at that speed. A RuntimeError on resume means the trajectory holds
+    fewer frames than the checkpoint implies (a stalled writer); its message says how to
+    recover. 
+    
+    OpenMM only guarantees that a checkpoint loads into an identical System on the
+    same platform, OpenMM version and hardware, so a run resumed on another GPU type may
+    not load its .chk; <save_name>.xml is the portable alternative.
+    """
 
     TRAJ = {"xtc": (app.XTCReporter, f"{save_name}.xtc"),    # ~0.2 MB/frame at
                                                              # 56k atoms

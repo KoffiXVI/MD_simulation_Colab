@@ -1,3 +1,7 @@
+"""Trajectory analysis: per-run tables (analyze_run), fraying statistics (analyze_fraying)
+and the spread across replicas (analyze_replicas). Column definitions are in the table
+metrics document."""
+
 from .constants import *
 import itertools, json
 from pathlib import Path
@@ -7,8 +11,26 @@ import mdtraj as md
 from scipy.spatial import cKDTree
 
 def load_run(run_dir, traj, stride=1, model="model.cif"):
-    """Water-free trajectory (whether or not water was written) and the built
-    model restricted to the same atoms."""
+    """Load a trajectory without water, whether or not water was written.
+
+    Parameters
+    ----------
+    run_dir : path-like
+        Folder holding the trajectory and the built model.
+    traj : str
+        Trajectory name, with or without .xtc/.dcd ("md", "equil", "md.xtc").
+    stride : int
+        Keep every n-th frame.
+    model : str
+        Built model file in run_dir, used as the topology.
+
+    Returns
+    -------
+    (md.Trajectory, md.Trajectory)
+        The water-free trajectory and the built model restricted to the same atoms.
+
+    """
+
     run_dir = Path(run_dir)
     path = run_dir / (traj if Path(traj).suffix in (".xtc", ".dcd") else f"{traj}.xtc")
     built = md.load(str(run_dir / model))
@@ -26,8 +48,23 @@ def load_run(run_dir, traj, stride=1, model="model.cif"):
     return t, built.atom_slice(dry)
 
 def design_pairs(db, nts):
-    """Dot-bracket ((), [], {}, <> for pseudoknots), strands in file order joined
-    by '+' or '&' -> set of residue-index pairs."""
+    """Turn a dot-bracket design into the set of designed base pairs.
+
+    Parameters
+    ----------
+    db : str
+        One character per nucleotide, strands in file order joined by "+" or "&":
+        "(" and ")" pair, "." is unpaired, "[]", "{}" and "<>" mark pseudoknotted pairs.
+        Example, a 12-nt overhang and a 12-bp duplex: "." * 12 + "(" * 12 + "+" + ")" * 12
+    nts : list of md.Residue
+        Nucleotides of the topology, in file order.
+
+    Returns
+    -------
+    set of frozenset
+        Pairs of 0-based topology residue indices.
+    """
+
     segs = db.replace("&", "+").replace(" ", "").split("+")
     by_chain = [[r for r in nts if r.chain.index == c] for c in sorted({r.chain.index for r in nts})]
     if [len(s) for s in segs] != [len(c) for c in by_chain]:
@@ -78,6 +115,7 @@ def _helix_ends(native, top):
 
 
 def _base_atoms(res):
+    """Heavy atoms of a nucleotide's base: no sugar (primed names), no phosphate."""
     return [a.index for a in res.atoms if a.element.symbol != "H" and "'" not in a.name
             and a.name not in ("P", "OP1", "OP2", "OP3")]
 
@@ -113,13 +151,89 @@ def _arm_allowed(pair, arm_list, top, skip):
 def analyze_run(run_dir, traj, design=None, stride=1, max_ns=None, cut=0.35,
                 min_open_ps=100, tail=0.5, image_every=10, model="model.cif",
                 arm=None, arm_cut=0.5, arm_skip=2, min_contact_ps=500):
-    """Same metrics for every experiment; writes <run_dir>/analysis/<traj>_*.
-    arm: None = nucleotides outside the native inter-strand duplex, an mdtraj selection
-    string (e.g. "chainid 1 and resSeq 13 to 68"), or False to skip the arm analysis.
-    arm_cut: contact distance (nm). arm_skip: arm nucleotides within this many positions of
-    EITHER partner of a pair, on that partner's strand, are ignored for that pair.
-    min_contact_ps: occ_arm_on / occ_arm_off are only given with this much time behind them.
-    Also writes <traj>_native_series.npz, the input of analyze_fraying().
+    """Structure, pairing, flexibility, ion, box and arm metrics for one trajectory.
+
+    Parameters
+    ----------
+    run_dir : path-like
+        Run folder: a replica folder, or a build folder for single runs.
+    traj : str
+        Trajectory name ("md", "equil", "A3_P1_200_ns_3", ...).
+    design : str, optional
+        Dot-bracket target structure (design_pairs). Without it, native pairs are those
+        formed in the built model (both H-bonds under cut + 0.05 nm), which can admit
+        diagonal cross-strand contacts in a distorted model; pass it whenever it is known.
+    stride : int
+        Keep every n-th frame.
+    max_ns : float, optional
+        Analyse only the first max_ns ns; appended to the output names ("md_100ns_...").
+    cut : float
+        H-bond heavy-atom distance (nm) under which a pair counts as formed (both bonds).
+    min_open_ps : float
+        Shortest open stretch counted in open_events.
+    tail : float
+        Final fraction of the run used for the summary's _tail means and slopes.
+    image_every : int
+        Frames between solute-image distance checks (1 = every frame, slower).
+    model : str
+        Built model file: topology and in_model reference.
+    arm : None, str or False
+        None: nucleotides outside the native inter-strand duplex, which includes any
+        intra-strand structure such as an aptamer domain; an mdtraj selection string
+        (e.g. "chainid 0 and resSeq 1 to 12"); False: no arm analysis.
+    arm_cut : float
+        Contact distance (nm) between arm heavy atoms and a pair's base atoms.
+    arm_skip : int
+        Arm nucleotides within this many positions of either partner, on that partner's
+        strand, are ignored for that pair (they are bonded to or stacked on it).
+    min_contact_ps : float
+        Least time with, and without, contact before occ_arm_on / occ_arm_off are given.
+
+    Returns
+    -------
+    frames : pandas.DataFrame   one row per frame (q_native, rmsd_nm, rg_nm, a_form, ...)
+    pairs : pandas.DataFrame    one row per native pair, pair present in the model, or
+                                non-native pair formed at least 5% of the time
+    nt : pandas.DataFrame       one row per nucleotide (rmsf_nm, paired, c3_endo)
+    summary : dict              run-level values: counts, tail means, slopes, arm statistics
+
+    Files written in `<run_dir>/analysis`
+    -----------------------------------
+    <stem>_frames.csv, <stem>_pairs.csv, <stem>_nt.csv, <stem>_summary.json, and
+    <stem>_native_series.npz (per-frame H-bond distances of the native pairs, read by
+    analyze_fraying).
+
+    Interpreting the results
+    ------------------------
+    - Integrity:    
+        - q_native near 1: the target structure holds. 
+        - A falling q_inter together with a jump in com_XY_nm: the strands are separating. 
+        
+    - Weak spots: native_below_50pct and the "weak or absent" table point to pairs that do
+                  not hold; native_missing_in_model > 0 means the starting structure was
+                  already off-target there.
+    - Pairs:     occupancy is the main figure; d1_A (about 2.9 A when intact) and occ_hb1
+                 separate partial from full breaking. Repeated open_events at helix ends
+                 are fraying; long openings inside a stem deserve a look in the trajectory.
+    - Convergence:  <metric>_slope_per_ns near 0 means a plateau. A steady fall in q_native
+                 or q_intra means structure is still being lost and the tail means are not
+                 equilibrium values; run longer before comparing systems.
+    - Geometry:     rmsd_core_nm of a few tenths of a nm is typical of an intact duplex;
+                 values near or above 1 nm signal rearrangement. a_form around 0.05-0.1 is
+                 B-DNA; a rise toward 1 signals an A-like transition. rmsf_nm separates the
+                 rigid core from floppy tails and loops.
+    - Ions:         cations_5A should plateau; a rising slope means the ion atmosphere is still
+                 adjusting, often because the structure is.
+    - Box:          min_image_nm must stay above the 1.0 nm cutoff; the summary keeps the
+                 minimum over sampled frames. Below it the solute touched its own image:
+                 rebuild with more padding.
+    - Arm:          arm_contact is how often arm nucleotides touch a pair's bases. Contact and
+                 opening are coupled both ways (open bases reach their neighbours; a docked
+                 base can open a pair), so arm_r_internal and arm_occ_shift show
+                 association, not cause. arm_r_internal is computed over native pairs that
+                 are not helix ends, rests on few points and is dominated by any that stay
+                 open; comparing constructs with and without the extra region is the
+                 stronger test.
     """
     run_dir = Path(run_dir)
     t, ref = load_run(run_dir, traj, stride, model)
@@ -418,13 +532,61 @@ def _stems(res, res_chain):
 
 def analyze_fraying(run_dir, traj, max_ns=None, lo=None, hi=0.45, full_open=False,
                     n_blocks=5, long_ps=100):
-    """How often, how long and how deep the native pairs fray, from the
-    <traj>_native_series.npz written by analyze_run; writes <traj>_fraying_*.
-    lo / hi (nm): closing and opening thresholds (lo defaults to analyze_run's cut).
-    Rates are two-state maximum-likelihood estimates, valid when an episode is cut off by
-    the end of the run: k_open = openings / time closed, tau_open = time open / closings.
-    p_open_se is a block estimate within this run; the spread across replicas is the
-    uncertainty to trust.
+    """How often, how long and how deep the native pairs open, from the
+    <stem>_native_series.npz of `analyze_run`.
+
+    Parameters
+    ----------
+    run_dir, traj, max_ns
+        As given to analyze_run; they locate the .npz.
+    lo : float, optional
+        Closing threshold (nm): a pair is closed once both H-bonds are below it; defaults
+        to analyze_run's cut.
+    hi : float
+        Opening threshold (nm): a pair is open once one H-bond exceeds it, or both with
+        full_open. Between lo and hi a pair keeps its previous state (dead band), so
+        flicker around one cutoff is not counted as openings.
+    full_open : bool
+        False counts any H-bond break, partial openings included; True only full openings.
+    n_blocks : int
+        Blocks for the within-run standard error p_open_se.
+    long_ps : float
+        Shortest opening counted in long_openings.
+
+    Returns
+    -------
+    pairs : pandas.DataFrame  one row per native pair: p_open, openings, rates, lifetimes
+    ends : pandas.DataFrame   one row per stem end: how often and how deep it frays
+    summary : dict            thresholds and totals
+
+    Files written in `<run_dir>`/analysis
+    -----------------------------------
+    <stem>_fraying_pairs.csv, <stem>_fraying_ends.csv, <stem>_fraying_frames.csv (fraying
+    depth per end and internal openings per stem, frame by frame, for plotting) and
+    <stem>_fraying.json.
+
+    Interpreting the results
+    ------------------------
+    - Frequency: openings_per_100ns and k_open_per_us (openings per microsecond of closed
+                 time, i.e. 1 / mean closed lifetime) are the most reproducible numbers; their counting error is about 1 / sqrt(openings).
+
+    - Duration: tau_open_ns is the mean open lifetime; median_open_ns and max_open_ns show whether a few long openings dominate. p_open is driven by those, so it varies most between replicas.
+    
+    - Criterion: the default (either H-bond) counts several times more events than
+                 full_open=True, mostly single H-bonds breaking; compare constructs under the same criterion and say which one you report.
+    
+    - Depth:    p_frayed is how often an end is open; p_depth_ge2 and p_depth_ge3 show how
+                far fraying spreads. Fraying that rarely passes the second pair is normal for an intact duplex.
+    
+    - Internal: p_internal_open should stay near 0: internal pairs open on millisecond
+                timescales, so openings inside a stem are rare in MD and worth checking in the trajectory 
+                (a sheared G-C pair keeping its untracked N2-O2 bond also reads as open).
+    
+    - Melting:  p_melted near 1 for a one-pair "stem" usually means a spurious native pair
+                that never formed (pass the design); for a real stem, it is unfolded.
+    
+    - Mostly-open pairs: k_open then counts re-openings after brief closings; read p_open
+                and tau_open_ns instead.
     """
     out = Path(run_dir) / "analysis"
     stem = Path(traj).stem + (f"_{max_ns:g}ns" if max_ns else "")
@@ -505,9 +667,59 @@ def analyze_fraying(run_dir, traj, max_ns=None, lo=None, hi=0.45, full_open=Fals
 
 
 def analyze_replicas(build_dir, traj="md", design=None, remote_root=None, fray_kw=None, **kw):
-    """analyze_run + analyze_fraying on every finished replica, then the spread across them.
-    Writes <build_dir>/replicas/pooled/<traj>_{pairs,ends,summary}.csv. Extra keyword
-    arguments go to analyze_run (e.g. image_every=1), fray_kw to analyze_fraying."""
+    """Analyse every finished replica of a build and summarise the spread across them.
+
+    Runs `analyze_run` and `analyze_fraying` on each replica folder holding `_done.json`, then
+    pools the results.
+
+    Parameters
+    ----------
+    build_dir : path-like
+        Build folder; replicas are read from <build_dir>/replicas unless remote_root is set.
+    traj : str
+        Production file stem of the replicas (run_replicas' save_name).
+    design : str, optional
+        Dot-bracket design for analyze_run (recommended).
+    remote_root : path-like, optional
+        Folder holding the rXX replica folders.
+    fray_kw : dict, optional
+        Settings for analyze_fraying, e.g. dict(full_open=True).
+    **kw
+        Settings for analyze_run, e.g. image_every=1, max_ns=100.
+
+    Returns
+    -------
+    pairs_out : pandas.DataFrame    per native pair (index: pair, end): <metric>_mean and
+                                    <metric>_sem across replicas, plus pooled rates
+                                    k_open_pooled_per_us and tau_open_pooled_ns
+    ends_out : pandas.DataFrame     per helix end: <metric>_mean and <metric>_sem
+    summary_out : pandas.DataFrame  per run-level metric (fraying ones prefixed fray_):
+                                    mean, sem, min, max, n
+
+    Files written in <replica root>/pooled
+    --------------------------------------
+    <traj>_pairs.csv, <traj>_ends.csv, <traj>_summary.csv, besides each replica's own
+    analysis files.
+
+    Interpreting the results
+    ------------------------
+    - SEM:      standard deviation across replicas / sqrt(n); with n = 3 it is itself\
+                uncertain by about +/-50%, so read it as an order of magnitude.
+    \n
+    - Agreement: compare a pair's p_open_sem with the replicas' own p_open_se (within-run \
+                 block errors in their fraying tables). A replica SEM several times larger \
+                 means the replicas sit in different states (a frayed versus a closed end, \
+                 say) and the mean describes none of them: report them separately, or start \
+                 them from a corrected structure.
+    \n           
+    - Pooled: rates all openings over all closed time; steadier than the mean of per-replica \
+              rates when events are few. A mean k_open is dominated by any replica in which the pair is mostly open.
+    \n        
+    - Worst case: for min_image_nm read the min column (the worst replica), not the mean.
+    \n
+    Assign the return value (pairs_out, ends_out, summary_out = ...) so a notebook does \
+    not print every table twice.
+    """
 
     root = Path(remote_root or Path(build_dir) / "replicas")
     reps = sorted(p for p in root.glob("r[0-9]*") if (p / "_done.json").exists())

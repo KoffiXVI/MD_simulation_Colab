@@ -1,3 +1,6 @@
+"""Drive helpers: mount and working directory, and the atomic copy, sync and restore that
+mirror local runs to Drive (Drive itself cannot keep up with trajectory appends)."""
+
 from .constants import *
 import os
 import json 
@@ -5,6 +8,21 @@ import shutil
 import time
 
 def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive'):
+    """Mount Google Drive (Colab only) and make `dest` the working directory.
+
+    Parameters
+    ----------
+    dest : str
+        Project folder, absolute or relative to the current directory; created if missing.
+
+    mount_loc : str
+        Drive mount point in Colab.
+
+    Note
+    ----
+    In Colab: mounts Drive, creates `dest`, copies the sources folder in when
+    `dest/sources` is missing. 
+    """
     
     if not in_collab:
         return
@@ -28,7 +46,22 @@ def set_dir(dest:str='MD_Simulation_Colab',mount_loc:str='/content/drive'):
 #drive funcs
 
 def restore_from_drive(remote, local):
-    """New session: copy the run back to local disk and verify it against the manifest."""
+    """Copy a mirrored run folder from Drive back to local disk and verify it.
+    Returns True when every file in the manifest exists and has its recorded size, else False
+
+    Parameters
+    ----------
+    remote : path-like
+        Drive folder written by sync_dir; must hold _manifest.json.
+    local : path-like
+        Local working folder; created if missing; existing files are overwritten.
+
+    Note
+    ----
+    False after a session that died mid-sync is usually harmless: each file is copied
+    atomically, so it is either the old or the new version, and produce() re-checks the
+    trajectory against the checkpoint before resuming. Read the printed problems first.
+    """
     remote, local = Path(remote), Path(local)
     local.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((remote / "_manifest.json").read_text())
@@ -45,8 +78,10 @@ def restore_from_drive(remote, local):
     return not bad
 
 def _copy_one(src: Path, dst: Path) -> int:
-    """Copy via a .part temp then rename, so a kill mid-copy cannot leave a
-    truncated file at the destination, same reasoning as atomic checkpoints."""
+    """Copy one file through `<dst>.part` and a rename, so a kill mid-copy never leaves a
+    truncated `dst`. Skipped when `dst` has the same size and is not older. Returns the
+    bytes copied (0 when skipped); raises IOError on a short copy."""
+
     if not src.exists():
         return 0
     if dst.exists() and dst.stat().st_size == src.stat().st_size \
@@ -71,8 +106,20 @@ def _copy_one(src: Path, dst: Path) -> int:
 
 STATE_LAST = (".chk", ".chk.bak", ".xml")
 def sync_dir(local, remote, quiet=False) -> int:
-    """Data files first, restart state last, then an atomically written manifest
-    that a later session can verify against."""
+    """Mirror the files of a local run folder to Drive (top level only, not recursive).
+
+    Data files go first and restart state last (.chk, .chk.bak, .xml), so the checkpoint
+    on Drive is never newer than the trajectory it belongs to; _manifest.json (file sizes)
+    is written last, atomically. Returns Bytes copied by call; unchanged files are skipped.
+
+    Parameters
+    ----------
+    local, remote : path-like
+        Source and destination folders. remote's parent must exist (if not, Drive is
+        probably not mounted); remote itself is created.
+    quiet : bool
+        Suppress the transfer summary line.
+    """
     local, remote = Path(local), Path(remote)
     if not remote.parent.exists():
         raise FileNotFoundError(f"{remote.parent} does not exist; is Drive mounted?")
@@ -100,7 +147,8 @@ def sync_dir(local, remote, quiet=False) -> int:
     return n
 
 def _mirror(local, remote):
-    """Push to Drive. Never let a transfer failure kill a good simulation."""
+    """sync_dir that never raises: a failed transfer is printed and the simulation goes on,
+    since the local copy is intact and the next mirror retries."""
     try:
         sync_dir(local, remote)
     except Exception as e:
